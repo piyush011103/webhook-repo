@@ -7,55 +7,79 @@ webhook = Blueprint("webhook", __name__)
 @webhook.route("/webhook", methods=["POST"])
 def github_webhook():
     payload = request.get_json(silent=True)
-
-    # 1️⃣ Validate payload exists
-    if not payload:
-        return jsonify({"error": "Invalid payload"}), 400
-
     event_type = request.headers.get("X-GitHub-Event")
 
-    # 2️⃣ Validate event type exists
-    if not event_type:
+    # Basic validation
+    if not payload or not event_type:
         return jsonify({"ignored": True}), 200
 
-    # 3️⃣ Handle PUSH event
+    data = None
+
+    # HANDLE PUSH EVENT
     if event_type == "push":
-        if "after" not in payload or "pusher" not in payload or "ref" not in payload:
+        ref = payload.get("ref")
+        commit_hash = payload.get("after")
+        pusher = payload.get("pusher", {}).get("name")
+
+        if not ref or not commit_hash or not pusher:
             return jsonify({"error": "Malformed push payload"}), 400
 
+        branch = ref.split("/")[-1]
+
         data = {
-            "request_id": payload["after"],
-            "author": payload["pusher"]["name"],
+            "request_id": commit_hash,
+            "author": pusher,
             "action": "PUSH",
-            "from_branch": None,
-            "to_branch": payload["ref"].split("/")[-1],
-            "timestamp": datetime.utcnow().strftime("%d %B %Y - %I:%M %p UTC")
+            "from_branch": branch,
+            "to_branch": branch,
+            "timestamp": datetime.utcnow()
         }
 
-    # 4️⃣ Handle PULL REQUEST & MERGE
+    # HANDLE PULL REQUEST + MERGE EVENTS
     elif event_type == "pull_request":
-        action = payload.get("action")
+        action_type = payload.get("action")
         pr = payload.get("pull_request")
 
-        if not pr or action not in ["opened", "closed"]:
+        if not pr:
             return jsonify({"ignored": True}), 200
 
-        is_merged = pr.get("merged", False)
+        # PULL REQUEST OPENED
+        if action_type == "opened":
+            data = {
+                "request_id": str(pr.get("number")),
+                "author": pr.get("user", {}).get("login"),
+                "action": "PULL_REQUEST",
+                "from_branch": pr.get("head", {}).get("ref"),
+                "to_branch": pr.get("base", {}).get("ref"),
+                "timestamp": datetime.utcnow()
+            }
 
-        data = {
-            "request_id": str(pr.get("id")),
-            "author": pr.get("user", {}).get("login"),
-            "action": "MERGE" if is_merged else "PULL_REQUEST",
-            "from_branch": pr.get("head", {}).get("ref"),
-            "to_branch": pr.get("base", {}).get("ref"),
-            "timestamp": datetime.utcnow().strftime("%d %B %Y - %I:%M %p UTC")
-        }
+        # MERGE (PR CLOSED + MERGED = TRUE)
+        elif action_type == "closed" and pr.get("merged"):
+            data = {
+                "request_id": str(pr.get("number")),
+                "author": pr.get("user", {}).get("login"),
+                "action": "MERGE",
+                "from_branch": pr.get("head", {}).get("ref"),
+                "to_branch": pr.get("base", {}).get("ref"),
+                "timestamp": datetime.utcnow()
+            }
 
-    # 5️⃣ Ignore all other GitHub events
+        else:
+            return jsonify({"ignored": True}), 200
+
+    # IGNORE ALL OTHER EVENTS
     else:
         return jsonify({"ignored": True}), 200
 
-    # 6️⃣ Store in MongoDB
+    # PREVENT DUPLICATES (GitHub retries deliveries)
+    if collection.find_one({
+        "request_id": data["request_id"],
+        "action": data["action"]
+    }):
+        return jsonify({"duplicate": True}), 200
+
+    # STORE IN MONGODB
     collection.insert_one(data)
 
     return jsonify({"status": "stored"}), 200
